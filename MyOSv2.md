@@ -13,22 +13,23 @@
 2. [Core Design Principles](#2-core-design-principles)
 3. [Role System](#3-role-system)
 4. [Deployment Topology](#4-deployment-topology)
-5. [Programs](#5-programs)
-6. [Avatar System](#6-avatar-system)
-7. [Courses & Sessions](#7-courses--sessions)
-8. [Enrollment & Access Control](#8-enrollment--access-control)
-9. [Session Runtime](#9-session-runtime)
-10. [AI Navigation Assistant](#10-ai-navigation-assistant)
-11. [RAG & Knowledge System](#11-rag--knowledge-system)
-12. [Memory System](#12-memory-system)
-13. [Analytics](#13-analytics)
-14. [Billing & Credits](#14-billing--credits)
-15. [Privacy & Compliance](#15-privacy--compliance)
-16. [Frontend Architecture](#16-frontend-architecture)
-17. [Infrastructure](#17-infrastructure)
-18. [Full Schema Reference](#18-full-schema-reference)
-19. [Entity Relationship Diagram](#19-entity-relationship-diagram)
-20. [Migration from v1](#20-migration-from-v1)
+5. [AI Services Architecture](#5-ai-services-architecture)
+6. [Programs](#6-programs)
+7. [Avatar System](#7-avatar-system)
+8. [Courses & Sessions](#8-courses--sessions)
+9. [Enrollment & Access Control](#9-enrollment--access-control)
+10. [Session Runtime](#10-session-runtime)
+11. [AI Navigation Assistant](#11-ai-navigation-assistant)
+12. [RAG & Knowledge System](#12-rag--knowledge-system)
+13. [Memory System](#13-memory-system)
+14. [Analytics](#14-analytics)
+15. [Billing & Credits](#15-billing--credits)
+16. [Privacy & Compliance](#16-privacy--compliance)
+17. [Frontend Architecture](#17-frontend-architecture)
+18. [Infrastructure](#18-infrastructure)
+19. [Full Schema Reference](#19-full-schema-reference)
+20. [Entity Relationship Diagram](#20-entity-relationship-diagram)
+21. [Migration from v1](#21-migration-from-v1)
 
 ---
 
@@ -107,13 +108,126 @@ Contabo VPS (Ubuntu)
     └─ Redis  ──  session cache, ephemeral token store, Celery broker
     │
     ├─→ AWS S3  ──  PDF/PPTX uploads, slide images, data exports
-    ├─→ OpenAI API  ──  Realtime (WebRTC voice), Chat Completions, Embeddings, Vision
+    ├─→ OpenAI API  ──  Realtime voice, Chat Completions, Embeddings, Vision
+    ├─→ K2 API      ──  Realtime voice, Chat Completions, Embeddings, Vision
+    │       (AIOrchestrator routes between OpenAI and K2 — see §5)
     └─→ HeyGen API  ──  Streaming avatar video rendering (client-side SDK)
 ```
 
 ---
 
-## 5. Programs
+## 5. AI Services Architecture
+
+### 5.1 Overview
+
+The platform supports two AI providers — **OpenAI** and **K2** — for all AI-heavy operations. Both providers cover the same three capability groups: realtime voice sessions, vision/slide processing, and LLM completions + embeddings. An `AIOrchestrator` service layer sits between the application and both providers, handling routing, fallback, and parallel execution.
+
+### 5.2 Provider capabilities
+
+| Capability | OpenAI | K2 |
+|---|---|---|
+| Realtime voice (WebRTC session tokens) | `gpt-realtime-2`, `gpt-audio-1.5` | K2 realtime models |
+| Vision / slide extraction | `gpt-4.1`, `gpt-4.1-mini` | K2 vision models |
+| Chat completions (assistant, summarization, quiz) | `gpt-4o`, `gpt-4o-mini` | K2 chat models |
+| Embeddings | `text-embedding-3-small` (1536-dim) | K2 embedding models |
+
+### 5.3 Service layer structure
+
+```
+app/services/ai/
+├── base.py              # AIProvider ABC — common interface for all providers
+├── openai_provider.py   # OpenAI implementation (refactored from openai_service.py)
+├── k2_provider.py       # K2 implementation
+└── orchestrator.py      # Routing, fallback, and parallel execution
+```
+
+`AIProvider` ABC defines four abstract methods:
+
+```python
+class AIProvider(ABC):
+    name: str  # "openai" | "k2"
+
+    async def generate_session_token(
+        self, *, instructions: str, tools: list, voice: str, model: str, **kwargs
+    ) -> Dict[str, Any]: ...
+
+    async def process_vision(
+        self, *, image_b64: str, prompt: str, model: str
+    ) -> Dict[str, Any]: ...
+
+    async def chat_completion(
+        self, *, messages: list, model: str, **kwargs
+    ) -> Dict[str, Any]: ...
+
+    async def embed(self, *, text: str, model: str) -> List[float]: ...
+```
+
+### 5.4 Execution modes
+
+The `AIOrchestrator` exposes three execution modes:
+
+| Mode | Behaviour | Primary use |
+|---|---|---|
+| **Routed** | One provider, selected by config | Realtime voice sessions — provider locked per avatar variant |
+| **Race** | Both run concurrently; first successful result returned, other cancelled | Vision slide processing — latency-sensitive |
+| **Parallel** | Both run; results kept separately | Dual embeddings for RAG A/B quality comparison |
+| **Fallback** | Primary runs; on failure, secondary is tried automatically | Session token minting for resilience |
+
+```python
+class AIOrchestrator:
+    async def session_token(self, *, provider: str, **kwargs):
+        """Routed: use the provider specified on the avatar variant."""
+
+    async def vision_race(self, **kwargs) -> Dict:
+        """Race: return the first successful vision result."""
+
+    async def embed_parallel(self, *, text: str) -> Dict[str, List[float]]:
+        """Parallel: return {"openai": [...], "k2": [...]} for A/B storage."""
+
+    async def chat(self, *, provider: str = "openai", **kwargs):
+        """Routed chat completion with optional fallback."""
+```
+
+### 5.5 Provider configuration hierarchy
+
+Provider selection is evaluated in order from most specific to least specific:
+
+```
+1. session_runs.ai_provider           (runtime override — rare)
+2. avatar_variants.realtime_provider  (per-variant config for voice sessions)
+3. Feature-level env var              (e.g. VISION_PROVIDER=k2, EMBED_PROVIDER=openai)
+4. AI_DEFAULT_PROVIDER env var        (platform-wide default)
+5. Hardcoded fallback: "openai"
+```
+
+### 5.6 Schema fields added for provider tracking
+
+| Table | Field | Type | Purpose |
+|---|---|---|---|
+| `avatar_variants` | `realtime_provider` | `VARCHAR(20)` | `'openai' \| 'k2' \| 'auto'` — which provider mints this variant's session token |
+| `session_runs` | `ai_provider` | `VARCHAR(20)` | Which provider was actually used (logged for billing + debugging) |
+| `slide_chunks` | `embedding_provider` | `VARCHAR(20)` | Which provider generated the embedding |
+| `knowledge_chunks` | `embedding_provider` | `VARCHAR(20)` | Which provider generated the embedding |
+| `usage_records` | `ai_provider` | `VARCHAR(20)` | Per-provider cost breakdown in billing |
+
+### 5.7 Dependency injection (FastAPI)
+
+Both providers and the orchestrator are registered as FastAPI dependencies:
+
+```python
+# app/dependencies.py
+def get_ai_orchestrator() -> AIOrchestrator:
+    return AIOrchestrator(providers={
+        "openai": OpenAIProvider(api_key=settings.openai_api_key),
+        "k2":     K2Provider(api_key=settings.k2_api_key),
+    })
+```
+
+Route handlers receive the orchestrator via `Depends(get_ai_orchestrator)`. The existing `openai_service.py` is kept as a thin adapter that delegates to `OpenAIProvider` during the migration period.
+
+---
+
+## 6. Programs
 
 ### 5.1 What a Program is
 
@@ -169,7 +283,7 @@ programs  ←─  publisher creates
 
 ---
 
-## 6. Avatar System
+## 7. Avatar System
 
 ### 6.1 Hierarchy
 
